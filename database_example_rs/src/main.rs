@@ -1,5 +1,3 @@
-mod dank;
-
 use anyhow::Result;
 use clap::Parser;
 use colored::*;
