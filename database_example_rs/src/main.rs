@@ -1,13 +1,15 @@
 use anyhow::Result;
+use bus::Bus;
 use clap::Parser;
 use colored::*;
 use crossbeam::thread;
-use crossbeam_channel::{unbounded, Sender};
 use log::{debug, info, LevelFilter};
 use redis::{Client, Connection, Msg, PubSub};
 use serde::{Deserialize, Serialize};
 use simple_logger::SimpleLogger;
 use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
+use std::thread as rs_threads;
 use tungstenite::{accept, Message};
 
 /// Simple POC to process received messages from a redis pubsub connection.
@@ -22,10 +24,16 @@ struct Opts {
     channel: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct OutgoingMessage {
     channel: String,
     message: String,
+}
+
+type MessageBus = Arc<Mutex<Bus<OutgoingMessage>>>;
+
+fn new_message_bus(length: usize) -> MessageBus {
+    return Arc::new(Mutex::new(Bus::new(length)));
 }
 
 fn main() -> Result<()> {
@@ -34,10 +42,35 @@ fn main() -> Result<()> {
         .init()
         .unwrap();
     let opts: Opts = Opts::parse();
-    let (s, r) = unbounded();
+    let bus = new_message_bus(10);
+    let broadcasting_bus = bus.clone();
 
     thread::scope(|scope| {
-        scope.spawn(move |_| {
+        scope.spawn(|_| {
+            let server = TcpListener::bind("127.0.0.1:9001").unwrap();
+            info!("websocket server started at localhost:9001");
+
+            for stream in server.incoming() {
+                let mut rxb = bus.clone().lock().unwrap().add_rx();
+                rs_threads::spawn(move || {
+                    let mut websocket = accept(stream.unwrap()).unwrap();
+                    let peer = websocket.get_mut().peer_addr().unwrap();
+                    info!("established a new connection: {}", peer);
+
+                    loop {
+                        if let Ok(msg) = rxb.recv() {
+                            let serialized = serde_json::to_string(&msg).unwrap();
+                            if websocket.write_message(Message::from(serialized)).is_err() {
+                                info!("removing disconnected peer: {}", peer);
+                                break;
+                            }
+                        }
+                    }
+                    info!("thread exited for: {}", peer);
+                });
+            }
+        });
+        scope.spawn(|_| {
             let mut connection = establish_connection(&opts).unwrap();
             let mut pubsub = connection.as_pubsub();
             pubsub.psubscribe(&opts.channel).unwrap();
@@ -46,50 +79,22 @@ fn main() -> Result<()> {
 
             loop {
                 match fetch_message(&mut pubsub) {
-                    Ok((msg, payload)) => process_message(&s, msg, payload),
+                    Ok((msg, payload)) => {
+                        let message = OutgoingMessage {
+                            message: payload,
+                            channel: msg.get_channel_name().into(),
+                        };
+                        debug!("ch '{}': {}", message.channel, message.message);
+                        broadcasting_bus.lock().unwrap().broadcast(message);
+                    }
                     Err(_) => continue,
                 }
             }
         });
-
-        let server = TcpListener::bind("127.0.0.1:9001").unwrap();
-        info!("websocket server started at localhost:9001");
-
-        for stream in server.incoming() {
-            scope.spawn(|_| {
-                let r2 = r.clone();
-                let mut websocket = accept(stream.unwrap()).unwrap();
-                let peer = websocket.get_mut().peer_addr().unwrap();
-                info!("established a new connection: {}", peer);
-
-                loop {
-                    match r2.recv() {
-                        Ok(msg) => {
-                            let message = OutgoingMessage {
-                                message: msg.get_payload().unwrap(),
-                                channel: msg.get_channel_name().to_string(),
-                            };
-
-                            let serialized = serde_json::to_string(&message).unwrap();
-                            if let Err(_) = websocket.write_message(Message::from(serialized)) {
-                                info!("removing disconnected peer: {}", peer);
-                                continue;
-                            }
-                        }
-                        Err(_) => continue,
-                    }
-                }
-            });
-        }
     })
     .unwrap();
 
-    return Ok(());
-}
-
-fn process_message(s: &Sender<Msg>, msg: Msg, payload: String) {
-    debug!("ch '{}': {}", msg.get_channel_name(), payload);
-    s.send(msg).unwrap();
+    Ok(())
 }
 
 fn fetch_message(pubsub: &mut PubSub) -> Result<(Msg, String)> {
